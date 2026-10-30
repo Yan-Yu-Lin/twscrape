@@ -1,3 +1,6 @@
+import asyncio
+import json
+
 import pytest
 
 from twscrape.accounts_pool import AccountsPool, NoAccountError
@@ -485,3 +488,82 @@ async def test_mark_inactive_records_cause(pool_mock: AccountsPool):
     assert acc.last_error_status == 401
     info = (await pool_mock.accounts_info())[0]
     assert info["last_error_cause"] == "auth_expired"
+
+
+async def test_reset_locks_keeps_sqlite_timestamp_format(pool_mock: AccountsPool):
+    """A retained rate limit must still expire: SQLite compares lock text lexically."""
+    import sqlite3
+
+    Q = "SearchTimeline"
+    await pool_mock.add_account("user1", "pass", "email", "ep")
+    await pool_mock.set_active("user1", True)
+    await pool_mock.lock_until("user1", Q, utc.ts() + 2, cause="rate_limit")
+    await pool_mock.get_for_queue("TweetDetail")  # a lease on another queue, then "crash"
+    await pool_mock.reset_locks(keep_rate_limited=True)
+    raw = sqlite3.connect(pool_mock._db_file).execute("SELECT locks FROM accounts").fetchone()[0]
+    assert all("T" not in v for v in json.loads(raw).values()), raw
+    assert await pool_mock.get_for_queue(Q) is None  # still limited
+    await asyncio.sleep(3.5)  # second-resolution timestamps: give a full extra second
+    assert await pool_mock.get_for_queue(Q) is not None  # expired on time
+
+
+async def test_save_writes_sqlite_timestamp_format(pool_mock: AccountsPool):
+    import sqlite3
+
+    await pool_mock.add_account("user1", "pass", "email", "ep")
+    acc = await pool_mock.get("user1")
+    acc.locks = {"SearchTimeline": utc.now()}
+    await pool_mock.save(acc)
+    raw = sqlite3.connect(pool_mock._db_file).execute("SELECT locks FROM accounts").fetchone()[0]
+    assert all("T" not in v for v in json.loads(raw).values()), raw
+
+
+async def test_v6_migration_backfills_rate_limit(tmp_path):
+    """A pre-v6 db with a lock must not have it wiped by the startup reset."""
+    import sqlite3
+
+    db = tmp_path / "legacy.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE accounts (
+            username TEXT PRIMARY KEY NOT NULL COLLATE NOCASE, password TEXT NOT NULL,
+            email TEXT NOT NULL COLLATE NOCASE, email_password TEXT NOT NULL, user_agent TEXT NOT NULL,
+            active BOOLEAN DEFAULT FALSE NOT NULL, locks TEXT DEFAULT '{}' NOT NULL,
+            headers TEXT DEFAULT '{}' NOT NULL, cookies TEXT DEFAULT '{}' NOT NULL,
+            proxy TEXT DEFAULT NULL, error_msg TEXT DEFAULT NULL,
+            stats TEXT DEFAULT '{}' NOT NULL, last_used TEXT DEFAULT NULL, _tx TEXT DEFAULT NULL,
+            mfa_code TEXT DEFAULT NULL, last_error_cause TEXT, last_error_status INTEGER, last_error_body TEXT
+        );
+        PRAGMA user_version = 5;
+        """
+    )
+    con.execute(
+        "INSERT INTO accounts(username,password,email,email_password,user_agent,active,locks,cookies) "
+        "VALUES ('u','_','_','_','@chrome',1,?,?)",
+        (
+            '{"SearchTimeline": "2099-01-01 00:00:00", "TweetDetail": "2099-01-01 00:00:00"}',
+            '{"ct0":"a","auth_token":"b"}',
+        ),
+    )
+    con.commit()
+    con.close()
+
+    pool = AccountsPool(str(db))
+    acc = await pool.get("u")  # triggers migration
+    assert acc.lock_causes == {"SearchTimeline": "rate_limit", "TweetDetail": "rate_limit"}
+    await pool.reset_locks(keep_rate_limited=True)
+    assert set((await pool.get("u")).locks) == {"SearchTimeline", "TweetDetail"}
+
+
+async def test_availability_mixed_breakage_and_busy_is_not_xclid(pool_mock: AccountsPool):
+    Q = "TweetDetail"
+    for name in ("user1", "user2"):
+        await pool_mock.add_account(name, "pass", "email", "ep")
+        await pool_mock.set_active(name, True)
+    await pool_mock.lock_until("user1", Q, utc.ts() + 900, cause="xclid_account")
+    assert await pool_mock.get_for_queue(Q) is not None  # user2 busy
+    info = await pool_mock.account_availability(Q)
+    assert info["cause"] == "all_in_use"
+    await pool_mock.lock_until("user2", Q, utc.ts() + 900, cause="rate_limit")
+    assert (await pool_mock.account_availability(Q))["cause"] == "all_rate_limited"

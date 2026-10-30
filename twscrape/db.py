@@ -105,6 +105,18 @@ async def migrate(db: aiosqlite.Connection):
         # Why each queue lock exists ({queue: cause}); locks are per queue, so
         # the cause has to be too, or a lease on one queue hides a rate limit on another.
         await db.execute("ALTER TABLE accounts ADD COLUMN lock_causes TEXT DEFAULT '{}' NOT NULL")
+        # Backfill: a pre-v6 record cannot say which of its locks are real rate
+        # limits and which are crashed leases, so treat every existing lock as a
+        # rate limit. Waiting out a stale lease costs at most 15 minutes; dropping a
+        # real X cooldown costs a wasted request and a longer lock.
+        await db.execute(
+            """
+            UPDATE accounts SET lock_causes = (
+                SELECT COALESCE(json_group_object(key, 'rate_limit'), '{}') FROM json_each(accounts.locks)
+            )
+            WHERE locks IS NOT NULL AND locks != '{}'
+            """
+        )
 
     migrations = {
         1: v1,

@@ -10,7 +10,7 @@ from .db import execute, fetchall, fetchone
 from .http import HttpStatusError
 from .logger import logger
 from .login import LoginConfig, login
-from .utils import get_env_bool, parse_cookies, utc
+from .utils import get_env_bool, parse_cookies, sqlite_datetime, utc
 
 NoAccountCause = Literal[
     "no_accounts_added",
@@ -309,7 +309,10 @@ class AccountsPool:
                 "UPDATE accounts SET locks = :locks, lock_causes = :causes WHERE username = :username",
                 {
                     "username": acc.username,
-                    "locks": json.dumps({q: t.isoformat() for q, t in keep.items()}),
+                    # SQLite's datetime() text form ('YYYY-MM-DD HH:MM:SS'): get_for_queue
+                    # compares lock strings against datetime('now') lexically, so an ISO
+                    # 'T' separator would sort after every SQLite timestamp of the same day
+                    "locks": json.dumps({q: sqlite_datetime(t) for q, t in keep.items()}),
                     "causes": json.dumps(dict.fromkeys(keep, "rate_limit")),
                 },
             )
@@ -492,10 +495,12 @@ class AccountsPool:
         causes = {x[0].lock_causes.get(queue) for x in locked}
         if "unknown" in causes:
             cause: NoAccountCause = "all_unknown_errors"
-        elif causes & set(BREAKAGE_CAUSES):
-            cause = "all_xclid_errors"
-        elif causes == {None}:
+        elif None in causes:
+            # at least one account is merely leased: wait, do not diagnose yet
             cause = "all_in_use"
+        elif causes <= set(BREAKAGE_CAUSES):
+            # every locked account hit XClId/GQL breakage: X changed something
+            cause = "all_xclid_errors"
         else:
             cause = "all_rate_limited"
         return {"cause": cause, "next_unlock_at": next_unlock_at, "accounts": accounts}

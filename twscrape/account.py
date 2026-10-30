@@ -9,7 +9,7 @@ from typing import Literal
 from .http import HttpClient
 from .http import make_client as _make_http_client
 from .models import JSONTrait
-from .utils import parse_proxy, utc
+from .utils import parse_proxy, sqlite_datetime, utc
 
 TOKEN = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
 LoginMethod = Literal["cookies", "password"]
@@ -63,7 +63,9 @@ class Account(JSONTrait):
 
     def to_rs(self):
         rs = asdict(self)
-        rs["locks"] = json.dumps(rs["locks"], default=lambda x: x.isoformat())
+        # same text form SQLite's datetime() writes, so lexical comparison in
+        # get_for_queue stays correct whichever path stored the lock
+        rs["locks"] = json.dumps(rs["locks"], default=sqlite_datetime)
         rs["lock_causes"] = json.dumps(rs["lock_causes"])
         rs["stats"] = json.dumps(rs["stats"])
         rs["headers"] = json.dumps(rs["headers"])

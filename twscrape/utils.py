@@ -23,6 +23,11 @@ class utc:
         return int(utc.now().timestamp())
 
 
+def sqlite_datetime(dt: datetime) -> str:
+    """The text form SQLite's datetime() produces, so stored locks stay comparable."""
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 async def gather(gen: AsyncGenerator[T, None]) -> list[T]:
     items = []
     async for x in gen:
