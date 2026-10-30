@@ -23,6 +23,7 @@ from .utils import utc
 from .xclid import XClIdAccountError, XClIdGen, XClIdParseError
 
 ReqParams = dict[str, str | int] | None
+ERROR_BODY_LIMIT = 500
 MISSING_FEATURES_RE = re.compile(r"The following features cannot be null: ([^;]+)")
 TMP_TS = utc.now().isoformat().split(".")[0].replace("T", "_").replace(":", "-")[0:16]
 
@@ -147,6 +148,11 @@ def has_error(errors: list[str], prefix: str) -> bool:
     return any(error.startswith(prefix) for error in errors)
 
 
+def response_body_snippet(rep: Response, limit: int = ERROR_BODY_LIMIT) -> str:
+    text = " ".join((rep.text or "").split())
+    return text[:limit]
+
+
 def parse_missing_features(msg: str) -> list[str]:
     """Feature flags X named in a (336) error: "...cannot be null: a, b"."""
     match = MISSING_FEATURES_RE.search(msg)
@@ -221,7 +227,15 @@ class QueueClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self._close_ctx()
 
-    async def _close_ctx(self, reset_at=-1, inactive=False, msg: str | None = None):
+    async def _close_ctx(
+        self,
+        reset_at=-1,
+        inactive=False,
+        msg: str | None = None,
+        *,
+        cause: str | None = None,
+        rep: Response | None = None,
+    ):
         if self.ctx is None:
             return
 
@@ -229,12 +243,26 @@ class QueueClient:
         username = ctx.acc.username
         await ctx.aclose()
 
+        status = rep.status_code if rep is not None else None
+        body = response_body_snippet(rep) if rep is not None else None
+
         if inactive:
-            await self.pool.mark_inactive(username, msg)
+            await self.pool.mark_inactive(
+                username, msg, cause=cause, error_status=status, error_body=body
+            )
             return
 
         if reset_at > 0:
-            await self.pool.lock_until(ctx.acc.username, self.queue, reset_at, ctx.req_count)
+            await self.pool.lock_until(
+                ctx.acc.username,
+                self.queue,
+                reset_at,
+                ctx.req_count,
+                cause=cause,
+                error_status=status,
+                error_body=body,
+                error_msg=msg,
+            )
             return
 
         await self.pool.unlock(ctx.acc.username, self.queue, ctx.req_count)
@@ -307,28 +335,28 @@ class QueueClient:
         # general api rate limit
         if limit_remaining == 0 and limit_reset > 0:
             logger.debug(f"Rate limited: {request_log}")
-            await self._close_ctx(limit_reset)
+            await self._close_ctx(limit_reset, msg=err_msg, cause="rate_limit", rep=rep)
             raise HandledError()
 
         # no way to check is account banned in direct way, but this check should work
         if has_error(errors, "(88) Rate limit exceeded") and limit_remaining > 0:
             logger.warning(f"Ban detected: {request_log}")
-            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            await self._close_ctx(-1, inactive=True, msg=err_msg, cause="banned", rep=rep)
             raise HandledError()
 
         if has_error(errors, "(326) Authorization: Denied by access control"):
             logger.warning(f"Ban detected: {request_log}")
-            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            await self._close_ctx(-1, inactive=True, msg=err_msg, cause="banned", rep=rep)
             raise HandledError()
 
         if has_error(errors, "(32) Could not authenticate you"):
             logger.warning(f"Session expired or banned: {request_log}")
-            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            await self._close_ctx(-1, inactive=True, msg=err_msg, cause="auth_expired", rep=rep)
             raise HandledError()
 
         if err_msg == "OK" and rep.status_code == 403:
             logger.warning(f"Session expired or banned: {request_log}")
-            await self._close_ctx(-1, inactive=True, msg=None)
+            await self._close_ctx(-1, inactive=True, msg=None, cause="auth_expired", rep=rep)
             raise HandledError()
 
         # content not found
@@ -357,7 +385,7 @@ class QueueClient:
             rep.raise_for_status()
         except HttpStatusError:
             logger.error(f"Unhandled API response code: {request_log}")
-            await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
+            await self._close_ctx(utc.ts() + 60 * 15, msg=err_msg, cause="unknown", rep=rep)
             raise HandledError()
 
     async def get(self, url: str, params: ReqParams = None) -> Response | None:
@@ -428,7 +456,7 @@ class QueueClient:
                 continue
             except XClIdAccountError as e:
                 logger.warning(self._format_ctx_error(ctx, e))
-                await self._close_ctx(utc.ts() + 60 * 15)
+                await self._close_ctx(utc.ts() + 60 * 15, msg=str(e), cause="xclid_account")
                 continue
             except XClIdParseError as e:
                 logger.error(
@@ -443,7 +471,7 @@ class QueueClient:
                     continue
 
                 logger.warning(f"{self._format_ctx_error(ctx, e)}; cooling account for 60s")
-                await self._close_ctx(utc.ts() + 60)
+                await self._close_ctx(utc.ts() + 60, msg=format_error(e), cause="transport")
                 continue
             except Exception as e:
                 if ctx.fail(FailKind.UNKNOWN):
@@ -457,4 +485,6 @@ class QueueClient:
                 ]
 
                 logger.warning(" ".join(msg))
-                await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
+                await self._close_ctx(
+                    utc.ts() + 60 * 15, msg=f"{type(e).__name__}: {e}", cause="unknown"
+                )  # 15 minutes

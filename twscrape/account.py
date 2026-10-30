@@ -34,6 +34,9 @@ class Account(JSONTrait):
     mfa_code: str | None = None
     proxy: str | None = None
     error_msg: str | None = None
+    last_error_cause: str | None = None  # rate_limit | banned | auth_expired | unknown
+    last_error_status: int | None = None
+    last_error_body: str | None = None
     last_used: datetime | None = None
     _tx: str | None = None
 

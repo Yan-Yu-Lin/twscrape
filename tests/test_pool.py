@@ -400,3 +400,67 @@ async def test_load_from_file(pool_mock: AccountsPool, tmp_path):
     usernames = {x.username for x in await pool_mock.get_all()}
     assert "user1" in usernames
     assert "user2" in usernames
+
+
+async def test_availability_in_use_vs_errors(pool_mock: AccountsPool):
+    Q = "TestQueue"
+    for name in ("user1", "user2"):
+        await pool_mock.add_account(name, "pass", "email", "ep")
+        await pool_mock.set_active(name, True)
+
+    # a stale failure cause must not survive the next lease
+    await pool_mock.lock_until("user1", Q, utc.ts() - 1, cause="unknown", error_status=500)
+    acc = await pool_mock.get_for_queue(Q)
+    assert acc is not None and acc.last_error_cause is None
+
+    # both leased (in use) -> all_in_use, not all_unknown_errors
+    assert await pool_mock.get_for_queue(Q) is not None
+    assert await pool_mock.get_for_queue(Q) is None
+    info = await pool_mock.account_availability(Q)
+    assert info["cause"] == "all_in_use"
+    assert info["next_unlock_at"] is not None
+
+    pool = AccountsPool(pool_mock._db_file, raise_when_no_account=True)
+    with pytest.raises(NoAccountError) as e:
+        await pool.get_for_queue_or_wait(Q)
+    assert e.value.cause == "all_in_use"
+    assert e.value.queue == Q
+
+    # a real rate limit on both -> all_rate_limited
+    for name in ("user1", "user2"):
+        await pool_mock.lock_until(name, Q, utc.ts() + 600, cause="rate_limit", error_status=429)
+    info = await pool_mock.account_availability(Q)
+    assert info["cause"] == "all_rate_limited"
+
+    await pool_mock.lock_until("user2", Q, utc.ts() + 600, cause="unknown", error_status=500)
+    info = await pool_mock.account_availability(Q)
+    assert info["cause"] == "all_unknown_errors"
+
+
+async def test_reset_locks_keep_rate_limited(pool_mock: AccountsPool):
+    Q = "TestQueue"
+    for name in ("user1", "user2"):
+        await pool_mock.add_account(name, "pass", "email", "ep")
+        await pool_mock.set_active(name, True)
+    await pool_mock.lock_until("user1", Q, utc.ts() + 600, cause="rate_limit")
+    assert await pool_mock.get_for_queue(Q) is not None  # user2 leased (crash simulation)
+    assert await pool_mock.get_for_queue(Q) is None
+
+    await pool_mock.reset_locks(keep_rate_limited=True)
+    acc = await pool_mock.get_for_queue(Q)
+    assert acc is not None and acc.username == "user2"
+    assert (await pool_mock.get("user1")).locks.get(Q) is not None
+
+    await pool_mock.reset_locks()
+    assert (await pool_mock.get("user1")).locks == {}
+
+
+async def test_mark_inactive_records_cause(pool_mock: AccountsPool):
+    await pool_mock.add_account("user1", "pass", "email", "ep")
+    await pool_mock.mark_inactive("user1", "(32) nope", cause="auth_expired", error_status=401)
+    acc = await pool_mock.get("user1")
+    assert acc.active is False
+    assert acc.last_error_cause == "auth_expired"
+    assert acc.last_error_status == 401
+    info = (await pool_mock.accounts_info())[0]
+    assert info["last_error_cause"] == "auth_expired"

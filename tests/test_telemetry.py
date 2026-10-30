@@ -8,7 +8,7 @@ URL = "https://x.com/i/api/graphql/id/SearchTimeline"
 @pytest.fixture(autouse=True)
 def allow_telemetry(monkeypatch):
     monkeypatch.delenv("DO_NOT_TRACK", raising=False)
-    monkeypatch.delenv("TWS_TELEMETRY", raising=False)
+    monkeypatch.setenv("TWS_TELEMETRY", "1")  # fork: telemetry is opt-in
 
 
 def telemetry_events():
@@ -115,7 +115,7 @@ def test_telemetry_aggregation_ignores_identity_properties(monkeypatch):
 
 
 def test_telemetry_respects_opt_out(monkeypatch):
-    monkeypatch.setenv("TWS_TELEMETRY", "0")
+    monkeypatch.delenv("TWS_TELEMETRY", raising=False)
     telemetry.capture("gql_request", {"operation": "SearchTimeline"})
     assert telemetry.snapshot() == []
 

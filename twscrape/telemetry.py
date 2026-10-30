@@ -59,7 +59,9 @@ def current_source() -> str:
 
 
 def _is_disabled() -> bool:
-    return os.getenv("TWS_TELEMETRY") == "0" or os.getenv("DO_NOT_TRACK") == "1"
+    # Fork: opt-in. This build runs on an unattended home server; it must not
+    # phone home unless explicitly asked to.
+    return os.getenv("TWS_TELEMETRY") != "1" or os.getenv("DO_NOT_TRACK") == "1"
 
 
 def capture(event: str, properties: dict[str, Any] | None = None) -> None:
