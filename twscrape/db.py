@@ -101,12 +101,18 @@ async def migrate(db: aiosqlite.Connection):
         await db.execute("ALTER TABLE accounts ADD COLUMN last_error_status INTEGER DEFAULT NULL")
         await db.execute("ALTER TABLE accounts ADD COLUMN last_error_body TEXT DEFAULT NULL")
 
+    async def v6():
+        # Why each queue lock exists ({queue: cause}); locks are per queue, so
+        # the cause has to be too, or a lease on one queue hides a rate limit on another.
+        await db.execute("ALTER TABLE accounts ADD COLUMN lock_causes TEXT DEFAULT '{}' NOT NULL")
+
     migrations = {
         1: v1,
         2: v2,
         3: v3,
         4: v4,
         5: v5,
+        6: v6,
     }
 
     # logger.debug(f"Current migration v{uv} (latest v{len(migrations)})")

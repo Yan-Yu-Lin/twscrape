@@ -28,6 +28,7 @@ class Account(JSONTrait):
     user_agent: str
     active: bool
     locks: dict[str, datetime] = field(default_factory=dict)  # queue: datetime
+    lock_causes: dict[str, str] = field(default_factory=dict)  # queue: why it is locked
     stats: dict[str, int] = field(default_factory=dict)  # queue: requests
     headers: dict[str, str] = field(default_factory=dict)
     cookies: dict[str, str] = field(default_factory=dict)
@@ -52,6 +53,7 @@ class Account(JSONTrait):
     def from_rs(rs: sqlite3.Row) -> "Account":
         doc = dict(rs)
         doc["locks"] = {k: utc.from_iso(v) for k, v in json.loads(doc["locks"]).items()}
+        doc["lock_causes"] = json.loads(doc.get("lock_causes") or "{}")
         doc["stats"] = {k: v for k, v in json.loads(doc["stats"]).items() if isinstance(v, int)}
         doc["headers"] = json.loads(doc["headers"])
         doc["cookies"] = json.loads(doc["cookies"])
@@ -62,6 +64,7 @@ class Account(JSONTrait):
     def to_rs(self):
         rs = asdict(self)
         rs["locks"] = json.dumps(rs["locks"], default=lambda x: x.isoformat())
+        rs["lock_causes"] = json.dumps(rs["lock_causes"])
         rs["stats"] = json.dumps(rs["stats"])
         rs["headers"] = json.dumps(rs["headers"])
         rs["cookies"] = json.dumps(rs["cookies"])

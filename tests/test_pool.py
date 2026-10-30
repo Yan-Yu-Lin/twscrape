@@ -411,7 +411,7 @@ async def test_availability_in_use_vs_errors(pool_mock: AccountsPool):
     # a stale failure cause must not survive the next lease
     await pool_mock.lock_until("user1", Q, utc.ts() - 1, cause="unknown", error_status=500)
     acc = await pool_mock.get_for_queue(Q)
-    assert acc is not None and acc.last_error_cause is None
+    assert acc is not None and Q not in acc.lock_causes  # last_error_cause stays as a diagnostic
 
     # both leased (in use) -> all_in_use, not all_unknown_errors
     assert await pool_mock.get_for_queue(Q) is not None
@@ -437,22 +437,43 @@ async def test_availability_in_use_vs_errors(pool_mock: AccountsPool):
     assert info["cause"] == "all_unknown_errors"
 
 
-async def test_reset_locks_keep_rate_limited(pool_mock: AccountsPool):
-    Q = "TestQueue"
+async def test_reset_locks_keep_rate_limited_per_queue(pool_mock: AccountsPool):
+    Q, Q2 = "SearchTimeline", "TweetDetail"
     for name in ("user1", "user2"):
         await pool_mock.add_account(name, "pass", "email", "ep")
         await pool_mock.set_active(name, True)
+    # user1: real rate limit on Q, then a lease on Q2 (must not erase the Q cause)
     await pool_mock.lock_until("user1", Q, utc.ts() + 600, cause="rate_limit")
-    assert await pool_mock.get_for_queue(Q) is not None  # user2 leased (crash simulation)
+    acc = await pool_mock.get_for_queue(Q2)
+    assert acc is not None and acc.username == "user1"
+    assert (await pool_mock.get("user1")).lock_causes == {Q: "rate_limit"}
+    # user2: crashed lease on Q
+    assert (await pool_mock.get_for_queue(Q)) is not None
     assert await pool_mock.get_for_queue(Q) is None
 
     await pool_mock.reset_locks(keep_rate_limited=True)
-    acc = await pool_mock.get_for_queue(Q)
-    assert acc is not None and acc.username == "user2"
-    assert (await pool_mock.get("user1")).locks.get(Q) is not None
+    u1, u2 = await pool_mock.get("user1"), await pool_mock.get("user2")
+    assert set(u1.locks) == {Q} and u1.lock_causes == {
+        Q: "rate_limit"
+    }  # rate limit kept, lease dropped
+    assert u2.locks == {} and u2.lock_causes == {}
 
     await pool_mock.reset_locks()
     assert (await pool_mock.get("user1")).locks == {}
+
+
+async def test_availability_reports_xclid_breakage(pool_mock: AccountsPool):
+    Q = "TweetDetail"
+    for name in ("user1", "user2"):
+        await pool_mock.add_account(name, "pass", "email", "ep")
+        await pool_mock.set_active(name, True)
+        await pool_mock.lock_until(name, Q, utc.ts() + 900, cause="xclid_account")
+    info = await pool_mock.account_availability(Q)
+    assert info["cause"] == "all_xclid_errors"
+    pool = AccountsPool(pool_mock._db_file, raise_when_no_account=True)
+    with pytest.raises(NoAccountError) as e:
+        await pool.get_for_queue_or_wait(Q)
+    assert e.value.cause == "all_xclid_errors"
 
 
 async def test_mark_inactive_records_cause(pool_mock: AccountsPool):

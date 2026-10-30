@@ -17,8 +17,12 @@ NoAccountCause = Literal[
     "all_rate_limited",
     "all_in_use",
     "all_banned",
+    "all_xclid_errors",
     "all_unknown_errors",
 ]
+
+# lock causes that mean "the request path is broken", not "this account is tired"
+BREAKAGE_CAUSES = ("xclid_account", "xclid_parse", "gql_outdated")
 
 
 class NoAccountError(Exception):
@@ -48,6 +52,7 @@ class AccountInfo(TypedDict):
     logged_in: bool
     active: bool
     locks: dict[str, datetime]
+    lock_causes: dict[str, str]
     last_used: datetime | None
     total_req: int
     error_msg: str | None
@@ -285,13 +290,29 @@ class AccountsPool:
         """Clear queue locks.
 
         A crashed process leaves its 15-minute in-use leases behind; call this at
-        startup. keep_rate_limited leaves locks set by an X rate limit in place
-        (they expire on X's schedule, clearing them just wastes a request).
+        startup. keep_rate_limited leaves, per queue, the locks X itself set with
+        a rate limit (they expire on X's schedule, clearing them wastes a request)
+        and drops everything else.
         """
-        qs = "UPDATE accounts SET locks = json_object()"
-        if keep_rate_limited:
-            qs += " WHERE last_error_cause IS NULL OR last_error_cause != 'rate_limit'"
-        await execute(self._db_file, qs)
+        if not keep_rate_limited:
+            await execute(
+                self._db_file,
+                "UPDATE accounts SET locks = json_object(), lock_causes = json_object()",
+            )
+            return
+        for acc in await self.get_all():
+            keep = {q: t for q, t in acc.locks.items() if acc.lock_causes.get(q) == "rate_limit"}
+            if keep == acc.locks:
+                continue
+            await execute(
+                self._db_file,
+                "UPDATE accounts SET locks = :locks, lock_causes = :causes WHERE username = :username",
+                {
+                    "username": acc.username,
+                    "locks": json.dumps({q: t.isoformat() for q, t in keep.items()}),
+                    "causes": json.dumps(dict.fromkeys(keep, "rate_limit")),
+                },
+            )
 
     async def set_active(self, username: str, active: bool):
         qs = "UPDATE accounts SET active = :active WHERE username = :username"
@@ -312,6 +333,7 @@ class AccountsPool:
         qs = f"""
         UPDATE accounts SET
             locks = json_set(locks, '$.{queue}', datetime({unlock_at}, 'unixepoch')),
+            lock_causes = json_set(lock_causes, '$.{queue}', :lock_cause),
             stats = json_set(stats, '$.{queue}', COALESCE(json_extract(stats, '$.{queue}'), 0) + {req_count}),
             last_used = datetime({utc.ts()}, 'unixepoch'),
             error_msg = COALESCE(:error_msg, error_msg),
@@ -326,6 +348,7 @@ class AccountsPool:
             {
                 "username": username,
                 "cause": cause,
+                "lock_cause": cause or "unknown",
                 "error_status": error_status,
                 "error_body": error_body,
                 "error_msg": error_msg,
@@ -336,6 +359,7 @@ class AccountsPool:
         qs = f"""
         UPDATE accounts SET
             locks = json_remove(locks, '$.{queue}'),
+            lock_causes = json_remove(lock_causes, '$.{queue}'),
             stats = json_set(stats, '$.{queue}', COALESCE(json_extract(stats, '$.{queue}'), 0) + {req_count}),
             last_used = datetime({utc.ts()}, 'unixepoch')
         WHERE username = :username
@@ -346,16 +370,15 @@ class AccountsPool:
         # if space in condition, it's a subquery, otherwise it's username
         condition = f"({condition})" if " " in condition else f"'{condition}'"
 
-        # Taking the lease clears last_error_cause: the lock now means "in use",
-        # not "failed". Otherwise a stale cause from an earlier failure makes
-        # account_availability report all_unknown_errors while accounts are
-        # merely busy. error_msg/status/body stay for diagnostics.
+        # Taking the lease drops this queue's cause: the lock now means "in
+        # use", not "failed". Other queues' causes (a real rate limit on
+        # SearchTimeline while we lease TweetDetail) are untouched.
         if int(sqlite3.sqlite_version_info[1]) >= 35:
             qs = f"""
             UPDATE accounts SET
                 locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
-                last_used = datetime({utc.ts()}, 'unixepoch'),
-                last_error_cause = NULL
+                lock_causes = json_remove(lock_causes, '$.{queue}'),
+                last_used = datetime({utc.ts()}, 'unixepoch')
             WHERE username = {condition}
             RETURNING *
             """
@@ -365,8 +388,8 @@ class AccountsPool:
             qs = f"""
             UPDATE accounts SET
                 locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
+                lock_causes = json_remove(lock_causes, '$.{queue}'),
                 last_used = datetime({utc.ts()}, 'unixepoch'),
-                last_error_cause = NULL,
                 _tx = '{tx}'
             WHERE username = {condition}
             """
@@ -440,8 +463,10 @@ class AccountsPool:
     async def account_availability(self, queue: str) -> dict:
         """Why get_for_queue returned nothing: {"cause", "next_unlock_at", "accounts"}.
 
-        A lock whose account has no last_error_cause is an in-use lease (see
+        A lock with no entry in lock_causes is an in-use lease (see
         _get_and_lock), so two busy accounts report all_in_use, not an error.
+        Locks from XClId / GQL breakage report all_xclid_errors so a caller can
+        tell "X changed something" from "wait a minute".
         """
         accounts = await self.get_all()
         now = utc.now()
@@ -464,9 +489,11 @@ class AccountsPool:
             return {"cause": "all_unknown_errors", "next_unlock_at": None, "accounts": accounts}
 
         next_unlock_at = min(x[1] for x in locked)
-        causes = {x[0].last_error_cause for x in locked}
+        causes = {x[0].lock_causes.get(queue) for x in locked}
         if "unknown" in causes:
             cause: NoAccountCause = "all_unknown_errors"
+        elif causes & set(BREAKAGE_CAUSES):
+            cause = "all_xclid_errors"
         elif causes == {None}:
             cause = "all_in_use"
         else:
@@ -586,6 +613,7 @@ class AccountsPool:
                 "login_method": x.login_method,
                 "active": x.active,
                 "locks": x.locks,
+                "lock_causes": x.lock_causes,
                 "last_used": x.last_used,
                 "total_req": sum(x.stats.values()),
                 "error_msg": str(x.error_msg)[0:60] if x.error_msg else None,
