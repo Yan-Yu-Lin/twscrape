@@ -118,6 +118,30 @@ async def migrate(db: aiosqlite.Connection):
             """
         )
 
+    async def v7():
+        # Repair for databases that ran the first v6 (which left lock_causes '{}'):
+        # any lock without a cause is treated as a rate limit, and lock timestamps
+        # written in ISO 'T' form are normalized to SQLite's datetime() text so
+        # lexical comparison against datetime('now') works.
+        await db.execute(
+            """
+            UPDATE accounts SET lock_causes = (
+                SELECT COALESCE(json_group_object(l.key, COALESCE(json_extract(accounts.lock_causes, '$.' || l.key), 'rate_limit')), '{}')
+                FROM json_each(accounts.locks) l
+            )
+            WHERE locks IS NOT NULL AND locks != '{}'
+            """
+        )
+        await db.execute(
+            """
+            UPDATE accounts SET locks = (
+                SELECT COALESCE(json_group_object(l.key, replace(substr(l.value, 1, 19), 'T', ' ')), '{}')
+                FROM json_each(accounts.locks) l
+            )
+            WHERE locks IS NOT NULL AND locks != '{}'
+            """
+        )
+
     migrations = {
         1: v1,
         2: v2,
@@ -125,6 +149,7 @@ async def migrate(db: aiosqlite.Connection):
         4: v4,
         5: v5,
         6: v6,
+        7: v7,
     }
 
     # logger.debug(f"Current migration v{uv} (latest v{len(migrations)})")

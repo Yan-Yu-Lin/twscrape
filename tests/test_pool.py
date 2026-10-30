@@ -567,3 +567,64 @@ async def test_availability_mixed_breakage_and_busy_is_not_xclid(pool_mock: Acco
     assert info["cause"] == "all_in_use"
     await pool_mock.lock_until("user2", Q, utc.ts() + 900, cause="rate_limit")
     assert (await pool_mock.account_availability(Q))["cause"] == "all_rate_limited"
+
+
+async def test_v7_repairs_first_v6_databases(tmp_path):
+    """A db already at v6 with empty lock_causes and ISO 'T' locks gets repaired."""
+    import sqlite3
+
+    db = tmp_path / "v6.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        CREATE TABLE accounts (
+            username TEXT PRIMARY KEY NOT NULL COLLATE NOCASE, password TEXT NOT NULL,
+            email TEXT NOT NULL COLLATE NOCASE, email_password TEXT NOT NULL, user_agent TEXT NOT NULL,
+            active BOOLEAN DEFAULT FALSE NOT NULL, locks TEXT DEFAULT '{}' NOT NULL,
+            headers TEXT DEFAULT '{}' NOT NULL, cookies TEXT DEFAULT '{}' NOT NULL,
+            proxy TEXT DEFAULT NULL, error_msg TEXT DEFAULT NULL,
+            stats TEXT DEFAULT '{}' NOT NULL, last_used TEXT DEFAULT NULL, _tx TEXT DEFAULT NULL,
+            mfa_code TEXT DEFAULT NULL, last_error_cause TEXT, last_error_status INTEGER, last_error_body TEXT,
+            lock_causes TEXT DEFAULT '{}' NOT NULL
+        );
+        PRAGMA user_version = 6;
+        """
+    )
+    con.execute(
+        "INSERT INTO accounts(username,password,email,email_password,user_agent,active,locks,lock_causes,cookies) "
+        "VALUES ('u','_','_','_','@chrome',1,?,?,?)",
+        (
+            '{"SearchTimeline": "2099-01-01T00:00:00+00:00", "TweetDetail": "2000-01-01T00:00:00"}',
+            '{"TweetDetail": "unknown"}',
+            '{"ct0":"a","auth_token":"b"}',
+        ),
+    )
+    con.commit()
+    con.close()
+
+    pool = AccountsPool(str(db))
+    acc = await pool.get("u")
+    assert acc.lock_causes == {"SearchTimeline": "rate_limit", "TweetDetail": "unknown"}
+    raw = sqlite3.connect(db).execute("SELECT locks FROM accounts").fetchone()[0]
+    assert all("T" not in v for v in json.loads(raw).values()), raw
+    # the expired (year 2000) TweetDetail lock is usable; the 2099 one is kept by reset
+    assert await pool.get_for_queue("TweetDetail") is not None
+    await pool.reset_locks(keep_rate_limited=True)
+    assert set((await pool.get("u")).locks) == {"SearchTimeline"}
+
+
+async def test_reset_locks_normalizes_even_when_all_kept(pool_mock: AccountsPool):
+    import sqlite3
+
+    await pool_mock.add_account("user1", "pass", "email", "ep")
+    await pool_mock.set_active("user1", True)
+    # emulate an older build: ISO 'T' lock already marked rate_limit
+    await pool_mock.lock_until("user1", "SearchTimeline", utc.ts() - 5, cause="rate_limit")
+    con = sqlite3.connect(pool_mock._db_file)
+    con.execute("UPDATE accounts SET locks = ?", ('{"SearchTimeline": "2026-10-30T14:00:00"}',))
+    con.commit()
+    con.close()
+    await pool_mock.reset_locks(keep_rate_limited=True)
+    raw = sqlite3.connect(pool_mock._db_file).execute("SELECT locks FROM accounts").fetchone()[0]
+    assert json.loads(raw) == {"SearchTimeline": "2026-10-30 14:00:00"}
+    assert await pool_mock.get_for_queue("SearchTimeline") is not None  # expired, acquirable

@@ -302,8 +302,9 @@ class AccountsPool:
             return
         for acc in await self.get_all():
             keep = {q: t for q, t in acc.locks.items() if acc.lock_causes.get(q) == "rate_limit"}
-            if keep == acc.locks:
+            if not acc.locks:
                 continue
+            # always rewrite: this also normalizes any lock text an older build stored
             await execute(
                 self._db_file,
                 "UPDATE accounts SET locks = :locks, lock_causes = :causes WHERE username = :username",
